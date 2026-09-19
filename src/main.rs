@@ -21,7 +21,7 @@ use woff2::build_woff2;
 #[derive(Parser, Debug)]
 #[command(name = "iconpacker", version, about)]
 struct Args {
-    /// Path to the config JSON (same shape as your existing font.json)
+    /// Path to the config JSON (same shape as your existing font.json). Pass "-" to read it from stdin.
     config: PathBuf,
 
     /// Override the config's "input" folder (glyph "src" paths are resolved against this)
@@ -65,11 +65,25 @@ struct ResolvedGlyph {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let raw_config = match std::fs::read_to_string(&args.config) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: could not read config '{}': {}", args.config.display(), e);
-            return ExitCode::FAILURE;
+    let reading_stdin = args.config == Path::new("-");
+
+    let raw_config = if reading_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        match std::io::stdin().read_to_string(&mut buf) {
+            Ok(_) => buf,
+            Err(e) => {
+                eprintln!("error: could not read config from stdin: {}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match std::fs::read_to_string(&args.config) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: could not read config '{}': {}", args.config.display(), e);
+                return ExitCode::FAILURE;
+            }
         }
     };
 
@@ -83,12 +97,17 @@ fn main() -> ExitCode {
 
     // Base dir for resolving relative glyph "src" paths:
     // config file's own directory, joined with config.input (or "." if absent),
-    // unless --input overrides it outright.
-    let config_dir = args
-        .config
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // unless --input overrides it outright. When the config came from stdin
+    // there's no file location to anchor to, so config.input (expected to be
+    // an absolute path in that case) is used as-is.
+    let config_dir = if reading_stdin {
+        PathBuf::from(".")
+    } else {
+        args.config
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
 
     let base_dir: PathBuf = if let Some(over) = &args.input {
         over.clone()
