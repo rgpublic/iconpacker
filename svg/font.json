@@ -1,0 +1,9 @@
+{
+  "props": { "family": "Iconpacker", "style": "Regular" },
+  "input": ".",
+  "output": ["iconpacker.woff2"],
+  "glyphs": {
+    "0xE001": { "src": "home.svg" }
+  }
+}
+
