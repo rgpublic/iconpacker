@@ -78,17 +78,26 @@ struct Tables {
     cpal: Cpal,
 }
 
-/// Builds every table for a font from a set of glyphs.
-///
-/// Glyph ID 0 is always the required, empty ".notdef" glyph; the rest are
-/// assigned IDs in the order given and mapped in `cmap` by their codepoint.
+/// Glyph ID 0 is always the required, empty ".notdef" glyph. Glyph ID 1 is
+/// ALSO always kept empty here - a permanent, deliberately unused spacer -
+/// and every real glyph starts at ID 2. This works around a real rendering
+/// bug observed on Windows 10 + Chrome: whatever occupies glyph ID 1 in a
+/// COLR font gets painted as an extra layer underneath every OTHER glyph
+/// drawn from that same font, regardless of which glyph was actually
+/// requested. Nothing in cmap or COLR ever points at ID 1, so as long as it
+/// stays a genuinely empty glyph, whatever draws on top of it draws nothing.
 fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, String> {
-    // --- glyf / loca: .notdef (empty) first, then every glyph in order ---
+    // --- glyf / loca: .notdef (empty), then the empty ID-1 spacer, then
+    // every real glyph in order ---
     let mut glyf_loca = GlyfLocaBuilder::new();
-    glyf_loca.add_glyph(&GlyfGlyph::Empty).map_err(|e| e.to_string())?;
+    glyf_loca.add_glyph(&GlyfGlyph::Empty).map_err(|e| e.to_string())?; // ID 0: .notdef
+    glyf_loca.add_glyph(&GlyfGlyph::Empty).map_err(|e| e.to_string())?; // ID 1: spacer
 
-    // .notdef: zero advance, zero side bearing, no bbox (empty glyph)
-    let mut h_metrics: Vec<LongMetric> = vec![LongMetric { advance: 0, side_bearing: 0 }];
+    // .notdef and the ID-1 spacer: zero advance, zero side bearing, no bbox
+    let mut h_metrics: Vec<LongMetric> = vec![
+        LongMetric { advance: 0, side_bearing: 0 },
+        LongMetric { advance: 0, side_bearing: 0 },
+    ];
 
     let mut x_min = i16::MAX;
     let mut y_min = i16::MAX;
@@ -212,11 +221,12 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         max_component_depth: Some(0),
     };
 
-    // --- cmap: codepoint -> glyph id (glyph id = index + 1, .notdef is 0) ---
+    // --- cmap: codepoint -> glyph id (glyph id = index + 2; ID 0 is .notdef,
+    // ID 1 is the permanently-empty spacer described above) ---
     let mappings = glyphs
         .iter()
         .enumerate()
-        .filter_map(|(i, g)| char::from_u32(g.codepoint).map(|ch| (ch, GlyphId::new((i + 1) as u32))));
+        .filter_map(|(i, g)| char::from_u32(g.codepoint).map(|ch| (ch, GlyphId::new((i + 2) as u32))));
     let cmap = Cmap::from_mappings(mappings).map_err(|e| e.to_string())?;
 
     // --- name (Windows, Unicode BMP, US English - the widely-supported minimum) ---
@@ -296,14 +306,16 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
     // emoji codepoints can be used directly instead of needing Private
     // Use Area remapping.
     //
-    // Glyph IDs here are exactly `index + 1` (see the cmap mapping above),
-    // so they're already in the ascending order the COLR spec requires
-    // for baseGlyphRecords.
+    // Glyph IDs here are exactly `index + 2` (see the cmap mapping above -
+    // ID 0 is .notdef, ID 1 is the permanently-empty spacer), so they're
+    // already in the ascending order the COLR spec requires for
+    // baseGlyphRecords. Glyph ID 1 deliberately never gets an entry here:
+    // it has no outline data to paint regardless.
     let base_glyph_records: Vec<BaseGlyph> = (0..glyphs.len() as u16)
-        .map(|i| BaseGlyph::new(GlyphId16::new(i + 1), i, 1))
+        .map(|i| BaseGlyph::new(GlyphId16::new(i + 2), i, 1))
         .collect();
     let layer_records: Vec<Layer> = (0..glyphs.len() as u16)
-        .map(|i| Layer::new(GlyphId16::new(i + 1), CPAL_FOREGROUND_COLOR_INDEX))
+        .map(|i| Layer::new(GlyphId16::new(i + 2), CPAL_FOREGROUND_COLOR_INDEX))
         .collect();
     let num_base_glyph_records = base_glyph_records.len() as u16;
     let num_layer_records = layer_records.len() as u16;
