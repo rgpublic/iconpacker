@@ -5,6 +5,8 @@
 use crate::outline::GlyphOutline;
 use kurbo::BezPath;
 use write_fonts::tables::cmap::Cmap;
+use write_fonts::tables::colr::{BaseGlyph, Colr, Layer};
+use write_fonts::tables::cpal::{ColorRecord, Cpal};
 use write_fonts::tables::glyf::{Glyf, GlyfLocaBuilder, Glyph as GlyfGlyph, SimpleGlyph};
 use write_fonts::tables::head::{Flags as HeadFlags, Head, MacStyle};
 use write_fonts::tables::hhea::Hhea;
@@ -14,8 +16,14 @@ use write_fonts::tables::maxp::Maxp;
 use write_fonts::tables::name::{Name, NameRecord};
 use write_fonts::tables::os2::{Os2, SelectionFlags};
 use write_fonts::tables::post::Post;
-use write_fonts::types::{Fixed, GlyphId, LongDateTime, NameId, Tag, Version16Dot16};
+use write_fonts::types::{Fixed, GlyphId, GlyphId16, LongDateTime, NameId, Tag, Version16Dot16};
 use write_fonts::{dump_table, FontBuilder};
+
+/// CPAL's reserved "foreground color" palette index: a COLR layer using it
+/// isn't tinted from the palette at all, it just paints in whatever color
+/// text currently has (CSS `color`, in a browser). See the CPAL spec:
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/cpal>.
+const CPAL_FOREGROUND_COLOR_INDEX: u16 = 0xFFFF;
 
 /// One glyph to include in the font: its Unicode codepoint and outline.
 pub struct FontGlyph {
@@ -66,6 +74,8 @@ struct Tables {
     os2: Os2,
     glyf: Glyf,
     loca: Loca,
+    colr: Colr,
+    cpal: Cpal,
 }
 
 /// Builds every table for a font from a set of glyphs.
@@ -268,6 +278,53 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         ..Os2::default()
     };
 
+    // --- COLR / CPAL ---
+    //
+    // Every real glyph gets wrapped as a trivial one-layer "color" glyph:
+    // its only layer is its own plain outline, painted at the CPAL
+    // "foreground color" sentinel rather than any stored palette color.
+    // No actual color data is introduced - visually this renders exactly
+    // like the plain glyf outline did, still tinted by CSS `color` the
+    // same way.
+    //
+    // The point is that browsers preferentially route Unicode codepoints
+    // with default emoji presentation (real emoji, e.g. U+1F354 HAMBURGER)
+    // to whichever available font provides *color* glyph data for them -
+    // a plain monochrome font is skipped in favor of the platform's own
+    // color emoji font, even when it's the only font specified. Having a
+    // (structurally trivial) COLR table satisfies that check, so real
+    // emoji codepoints can be used directly instead of needing Private
+    // Use Area remapping.
+    //
+    // Glyph IDs here are exactly `index + 1` (see the cmap mapping above),
+    // so they're already in the ascending order the COLR spec requires
+    // for baseGlyphRecords.
+    let base_glyph_records: Vec<BaseGlyph> = (0..glyphs.len() as u16)
+        .map(|i| BaseGlyph::new(GlyphId16::new(i + 1), i, 1))
+        .collect();
+    let layer_records: Vec<Layer> = (0..glyphs.len() as u16)
+        .map(|i| Layer::new(GlyphId16::new(i + 1), CPAL_FOREGROUND_COLOR_INDEX))
+        .collect();
+    let num_base_glyph_records = base_glyph_records.len() as u16;
+    let num_layer_records = layer_records.len() as u16;
+    let colr = Colr::new(
+        num_base_glyph_records,
+        Some(base_glyph_records),
+        Some(layer_records),
+        num_layer_records,
+    );
+
+    // CPAL is mandatory alongside COLR but its one color is never actually
+    // read (every layer above uses the 0xFFFF sentinel instead of a real
+    // palette index) - it just has to be structurally present and valid.
+    let cpal = Cpal::new(
+        1, // num_palette_entries
+        1, // num_palettes
+        1, // num_color_records
+        Some(vec![ColorRecord { red: 0, green: 0, blue: 0, alpha: 255 }]),
+        vec![0], // color_record_indices
+    );
+
     Ok(Tables {
         head,
         hhea,
@@ -279,6 +336,8 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         os2,
         glyf,
         loca,
+        colr,
+        cpal,
     })
 }
 
@@ -307,6 +366,10 @@ pub fn build_font(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Vec<u8
         .add_table(&t.glyf)
         .map_err(|e| e.to_string())?
         .add_table(&t.loca)
+        .map_err(|e| e.to_string())?
+        .add_table(&t.colr)
+        .map_err(|e| e.to_string())?
+        .add_table(&t.cpal)
         .map_err(|e| e.to_string())?;
 
     Ok(builder.build())
@@ -329,5 +392,7 @@ pub fn build_font_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result
         (Tag::new(b"OS/2"), dump_table(&t.os2).map_err(|e| e.to_string())?),
         (Tag::new(b"glyf"), dump_table(&t.glyf).map_err(|e| e.to_string())?),
         (Tag::new(b"loca"), dump_table(&t.loca).map_err(|e| e.to_string())?),
+        (Tag::new(b"COLR"), dump_table(&t.colr).map_err(|e| e.to_string())?),
+        (Tag::new(b"CPAL"), dump_table(&t.cpal).map_err(|e| e.to_string())?),
     ])
 }
