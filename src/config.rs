@@ -23,6 +23,11 @@ pub struct Config {
 pub struct GlyphEntry {
     pub src: String,
 
+    /// Keep the SVG's own fill colors (as COLR layers) instead of flattening
+    /// it to one outline that follows CSS `color`. Off by default.
+    #[serde(default)]
+    pub color: bool,
+
     /// any other per-glyph attributes (width, emoji, altuni, ...) - kept but not
     /// interpreted yet
     #[serde(flatten)]

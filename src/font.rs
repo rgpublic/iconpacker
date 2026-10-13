@@ -3,6 +3,7 @@
 //! name, glyf, loca) via the `write-fonts` crate.
 
 use crate::outline::GlyphOutline;
+use crate::svg::Paint;
 use kurbo::BezPath;
 use write_fonts::tables::cmap::Cmap;
 use write_fonts::tables::colr::{BaseGlyph, Colr, Layer};
@@ -25,10 +26,22 @@ use write_fonts::{dump_table, FontBuilder};
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/cpal>.
 const CPAL_FOREGROUND_COLOR_INDEX: u16 = 0xFFFF;
 
+/// One painted layer of a color glyph.
+#[derive(Debug)]
+pub struct FontLayer {
+    pub paint: Paint,
+    pub outline: GlyphOutline,
+}
+
 /// One glyph to include in the font: its Unicode codepoint and outline.
+///
+/// `outline` is always the full merged shape (it is what non-COLR renderers
+/// fall back to). `layers` is empty for a normal monochrome glyph; for a
+/// color glyph it holds the painted layers, in drawing order.
 pub struct FontGlyph {
     pub codepoint: u32,
     pub outline: GlyphOutline,
+    pub layers: Vec<FontLayer>,
 }
 
 /// Turns a `GlyphOutline`'s contours into a `kurbo::BezPath` - the shape
@@ -131,6 +144,29 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
 
         h_metrics.push(LongMetric { advance, side_bearing: lsb });
         glyf_loca.add_glyph(&simple).map_err(|e| e.to_string())?;
+    }
+
+    // --- layer glyphs of color glyphs, after every base glyph so base glyph
+    // IDs stay exactly `index + 2`. `layer_glyph_ids[i]` holds the glyph IDs
+    // of glyph i's layers (empty for monochrome glyphs). ---
+    let mut layer_glyph_ids: Vec<Vec<u16>> = Vec::with_capacity(glyphs.len());
+    let mut next_glyph_id: u32 = h_metrics.len() as u32;
+    for g in glyphs {
+        let mut ids = Vec::with_capacity(g.layers.len());
+        for layer in &g.layers {
+            let path = outline_to_bezpath(&layer.outline);
+            let simple = SimpleGlyph::from_bezpath(&path)
+                .map_err(|e| format!("glyph U+{:04X} layer: {:?}", g.codepoint, e))?;
+            let advance = layer.outline.advance_width.clamp(0, u16::MAX as i32) as u16;
+            h_metrics.push(LongMetric { advance, side_bearing: simple.bbox.x_min });
+            glyf_loca.add_glyph(&simple).map_err(|e| e.to_string())?;
+            if next_glyph_id > u16::MAX as u32 {
+                return Err("too many glyphs (including color layers): glyph IDs exceed 65535".to_string());
+            }
+            ids.push(next_glyph_id as u16);
+            next_glyph_id += 1;
+        }
+        layer_glyph_ids.push(ids);
     }
 
     if glyphs.is_empty() {
@@ -311,12 +347,37 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
     // already in the ascending order the COLR spec requires for
     // baseGlyphRecords. Glyph ID 1 deliberately never gets an entry here:
     // it has no outline data to paint regardless.
-    let base_glyph_records: Vec<BaseGlyph> = (0..glyphs.len() as u16)
-        .map(|i| BaseGlyph::new(GlyphId16::new(i + 2), i, 1))
-        .collect();
-    let layer_records: Vec<Layer> = (0..glyphs.len() as u16)
-        .map(|i| Layer::new(GlyphId16::new(i + 2), CPAL_FOREGROUND_COLOR_INDEX))
-        .collect();
+      //
+    // Monochrome glyphs get one layer: their own base glyph, painted with the
+    // foreground sentinel. Color glyphs get one layer per painted run, each
+    // pointing at its own layer glyph. Layers of one glyph must be contiguous
+    // in layerRecords, which building them glyph by glyph guarantees.
+    let mut palette: Vec<ColorRecord> = vec![ColorRecord { red: 0, green: 0, blue: 0, alpha: 255 }];
+    let mut palette_index: std::collections::HashMap<(u8, u8, u8, u8), u16> = std::collections::HashMap::new();
+    let mut base_glyph_records: Vec<BaseGlyph> = Vec::with_capacity(glyphs.len());
+    let mut layer_records: Vec<Layer> = Vec::new();
+    for (i, g) in glyphs.iter().enumerate() {
+        let first_layer = layer_records.len();
+        if g.layers.is_empty() {
+            layer_records.push(Layer::new(GlyphId16::new(i as u16 + 2), CPAL_FOREGROUND_COLOR_INDEX));
+        } else {
+            for (layer, glyph_id) in g.layers.iter().zip(&layer_glyph_ids[i]) {
+                let color_index = match layer.paint {
+                    Paint::Foreground => CPAL_FOREGROUND_COLOR_INDEX,
+                    Paint::Rgba(r, gr, b, a) => *palette_index.entry((r, gr, b, a)).or_insert_with(|| {
+                        palette.push(ColorRecord { red: r, green: gr, blue: b, alpha: a });
+                        (palette.len() - 1) as u16
+                    }),
+                };
+                layer_records.push(Layer::new(GlyphId16::new(*glyph_id), color_index));
+            }
+        }
+        let num_layers = layer_records.len() - first_layer;
+        if layer_records.len() > u16::MAX as usize {
+            return Err("too many COLR layers: more than 65535".to_string());
+        }
+        base_glyph_records.push(BaseGlyph::new(GlyphId16::new(i as u16 + 2), first_layer as u16, num_layers as u16));
+    }
     let num_base_glyph_records = base_glyph_records.len() as u16;
     let num_layer_records = layer_records.len() as u16;
     let colr = Colr::new(
@@ -326,14 +387,15 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         num_layer_records,
     );
 
-    // CPAL is mandatory alongside COLR but its one color is never actually
-    // read (every layer above uses the 0xFFFF sentinel instead of a real
-    // palette index) - it just has to be structurally present and valid.
+    // CPAL is mandatory alongside COLR. Entry 0 is a black placeholder that
+    // nothing references (monochrome layers use the 0xFFFF sentinel); real
+    // layer colors follow it.
+    let palette_len = palette.len() as u16;
     let cpal = Cpal::new(
-        1, // num_palette_entries
-        1, // num_palettes
-        1, // num_color_records
-        Some(vec![ColorRecord { red: 0, green: 0, blue: 0, alpha: 255 }]),
+        palette_len, // num_palette_entries
+        1,           // num_palettes
+        palette_len, // num_color_records
+        Some(palette),
         vec![0], // color_record_indices
     );
 

@@ -6,12 +6,12 @@ mod woff2;
 
 use clap::Parser;
 use config::{parse_codepoint, Config};
-use font::{build_font, build_font_tables, FontGlyph};
+use font::{build_font, build_font_tables, FontGlyph, FontLayer};
+use svg::{parse_svg_layers, parse_svg_raw, summarize, OutlineSummary, Paint, RawOutline};
 use outline::{build_glyph_outline, GlyphOutline};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use svg::{parse_svg_raw, summarize, OutlineSummary};
 use woff2::build_woff2;
 
 /// iconpacker - step 3: load a font.json-style config, resolve every glyph's
@@ -60,6 +60,23 @@ struct ResolvedGlyph {
     outline: Option<OutlineSummary>,
     glyph: Option<GlyphOutline>,
     parse_error: Option<String>,
+    color: bool,
+    #[serde(skip)]
+    layers: Vec<FontLayer>,
+}
+
+/// Default cap on distinct colors per color glyph. Every extra color costs
+/// extra layer glyphs in the font, so an SVG with dozens of shades (a photo
+/// traced to vectors, say) is rejected rather than silently bloating it.
+/// Override with `"max_colors"` in the config's `props`.
+const DEFAULT_MAX_COLORS: usize = 8;
+
+fn describe_paint(p: &Paint) -> String {
+    match p {
+        Paint::Foreground => "black/currentColor".to_string(),
+        Paint::Rgba(r, g, b, 255) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+        Paint::Rgba(r, g, b, a) => format!("#{:02x}{:02x}{:02x}/{}", r, g, b, a),
+    }
 }
 
 fn main() -> ExitCode {
@@ -126,8 +143,17 @@ fn main() -> ExitCode {
         .and_then(Value::as_str)
         .unwrap_or("(no family set)");
 
+    let max_colors = config
+        .props
+        .get("max_colors")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_COLORS);
+
     let mut resolved = Vec::new();
     let mut missing = 0usize;
+
+    let mut color_errors = 0usize;
 
     for (key, entry) in &config.glyphs {
         let codepoint = parse_codepoint(key);
@@ -140,6 +166,7 @@ fn main() -> ExitCode {
         let mut outline = None;
         let mut glyph = None;
         let mut parse_error = None;
+        let mut layers: Vec<FontLayer> = Vec::new();
 
         if exists {
             match parse_svg_raw(&resolved_path) {
@@ -148,6 +175,66 @@ fn main() -> ExitCode {
                     glyph = Some(build_glyph_outline(&raw, args.upm, args.accuracy));
                 }
                 Err(e) => parse_error = Some(e),
+            }
+
+            // Layer analysis runs for every glyph: color glyphs need it to be
+            // built, and monochrome ones use it to warn when an SVG carries
+            // colors that are about to be flattened away.
+            if let Ok(raw_layers) = parse_svg_layers(&resolved_path) {
+                let paints = raw_layers.distinct_paints();
+                let label = &entry.src;
+
+                for note in &raw_layers.notes {
+                    eprintln!("warning: {}: {}", label, note);
+                }
+
+                if entry.color {
+                    if paints.len() > max_colors {
+                        eprintln!(
+                            "error: {}: {} distinct colors, but the limit is {} (set \"max_colors\" in props to raise it, or simplify the SVG)",
+                            label,
+                            paints.len(),
+                            max_colors
+                        );
+                        color_errors += 1;
+                    } else if paints.is_empty() {
+                        eprintln!("warning: {}: marked color but has no filled paths; treated as monochrome", label);
+                    } else {
+                        if paints.len() == 1 {
+                            if paints[0] == Paint::Foreground {
+                                eprintln!(
+                                    "warning: {}: marked color but contains only black/currentColor, so it behaves like a monochrome icon; remove \"color\" to keep it simple",
+                                    label
+                                );
+                            } else {
+                                eprintln!(
+                                    "warning: {}: marked color but contains only one color ({}); if it should follow CSS color, remove \"color\"",
+                                    label,
+                                    describe_paint(&paints[0])
+                                );
+                            }
+                        }
+                        for l in &raw_layers.layers {
+                            let layer_raw = RawOutline {
+                                width: raw_layers.width,
+                                height: raw_layers.height,
+                                segments: l.segments.clone(),
+                            };
+                            let outline = build_glyph_outline(&layer_raw, args.upm, args.accuracy);
+                            if !outline.contours.is_empty() {
+                                layers.push(FontLayer { paint: l.paint, outline });
+                            }
+                        }
+                    }
+                } else if paints.len() > 1 {
+                    let list: Vec<String> = paints.iter().map(describe_paint).collect();
+                    eprintln!(
+                        "warning: {}: contains {} distinct colors ({}) but \"color\" is not set, so it is flattened to one monochrome shape",
+                        label,
+                        paints.len(),
+                        list.join(", ")
+                    );
+                }
             }
         }
 
@@ -161,6 +248,8 @@ fn main() -> ExitCode {
             outline,
             glyph,
             parse_error,
+            color: entry.color,
+            layers
         });
     }
 
@@ -206,9 +295,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if color_errors > 0 {
+        eprintln!("\n{} glyph(s) exceed the color limit", color_errors);
+        return ExitCode::FAILURE;
+    }
+
     if args.out.is_some() || args.woff2.is_some() {
         let font_glyphs: Vec<FontGlyph> = resolved
-            .iter()
+            .iter_mut()
             .filter_map(|g| {
                 let codepoint = g.codepoint?;
                 // glyph field is only None if outline parsing failed above,
@@ -216,6 +310,7 @@ fn main() -> ExitCode {
                 Some(FontGlyph {
                     codepoint,
                     outline: g.glyph.as_ref()?.clone(),
+                    layers: std::mem::take(&mut g.layers)
                 })
             })
             .collect();

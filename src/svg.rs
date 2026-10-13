@@ -82,6 +82,121 @@ fn visit(node: &usvg::Node, segments: &mut Vec<Seg>) {
     }
 }
 
+/// How one layer of a color glyph is painted: either "whatever CSS `color`
+/// currently is" (opaque black in the source SVG is treated as this, so
+/// monochrome parts of a color icon still follow the page's text color), or
+/// a fixed RGBA color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Paint {
+    Foreground,
+    Rgba(u8, u8, u8, u8),
+}
+
+/// A run of consecutive same-painted path data from one SVG. Layers keep the
+/// SVG's drawing order so overlapping shapes stack the same way they do in
+/// the source file.
+pub struct RawLayer {
+    pub paint: Paint,
+    pub segments: Vec<Seg>,
+}
+
+/// An SVG split into painted layers instead of one merged outline.
+pub struct RawLayers {
+    pub width: f32,
+    pub height: f32,
+    pub layers: Vec<RawLayer>,
+    /// Human-readable notes about things that were approximated (gradients).
+    pub notes: Vec<String>,
+}
+
+impl RawLayers {
+    /// Number of distinct paints across all layers.
+    pub fn distinct_paints(&self) -> Vec<Paint> {
+        let mut seen: Vec<Paint> = Vec::new();
+        for layer in &self.layers {
+            if !seen.contains(&layer.paint) {
+                seen.push(layer.paint);
+            }
+        }
+        seen
+    }
+}
+
+/// Like `parse_svg_raw`, but keeps each path's fill. Paths without a fill
+/// (stroke-only) are skipped, since an icon font can only paint filled
+/// outlines. Gradients are approximated by their first stop's color, and a
+/// note is recorded so the caller can warn.
+pub fn parse_svg_layers(svg_path: &Path) -> Result<RawLayers, String> {
+    let text = std::fs::read_to_string(svg_path).map_err(|e| e.to_string())?;
+    let tree = usvg::Tree::from_str(&text, &usvg::Options::default()).map_err(|e| e.to_string())?;
+
+    let size = tree.size();
+    let mut layers: Vec<RawLayer> = Vec::new();
+    let mut notes = Vec::new();
+    for child in tree.root().children() {
+        visit_layers(child, &mut layers, &mut notes);
+    }
+    notes.dedup();
+
+    Ok(RawLayers {
+        width: size.width(),
+        height: size.height(),
+        layers,
+        notes,
+    })
+}
+
+fn paint_of(fill: &usvg::Fill, notes: &mut Vec<String>) -> Paint {
+    let color = match fill.paint() {
+        usvg::Paint::Color(c) => *c,
+        usvg::Paint::LinearGradient(g) => {
+            notes.push("gradient fill approximated by its first stop color".to_string());
+            first_stop(g.stops())
+        }
+        usvg::Paint::RadialGradient(g) => {
+            notes.push("gradient fill approximated by its first stop color".to_string());
+            first_stop(g.stops())
+        }
+        usvg::Paint::Pattern(_) => {
+            notes.push("pattern fill approximated as black".to_string());
+            usvg::Color::black()
+        }
+    };
+    let alpha = (fill.opacity().get() * 255.0).round() as u8;
+    if color == usvg::Color::black() && alpha == 255 {
+        Paint::Foreground
+    } else {
+        Paint::Rgba(color.red, color.green, color.blue, alpha)
+    }
+}
+
+fn first_stop(stops: &[usvg::Stop]) -> usvg::Color {
+    stops.first().map(|s| s.color()).unwrap_or_else(usvg::Color::black)
+}
+
+fn visit_layers(node: &usvg::Node, layers: &mut Vec<RawLayer>, notes: &mut Vec<String>) {
+    match node {
+        usvg::Node::Group(group) => {
+            for child in group.children() {
+                visit_layers(child, layers, notes);
+            }
+        }
+        usvg::Node::Path(path) => {
+            let Some(fill) = path.fill() else { return };
+            let paint = paint_of(fill, notes);
+
+            let mut segments = Vec::new();
+            visit(node, &mut segments);
+
+            match layers.last_mut() {
+                Some(last) if last.paint == paint => last.segments.extend(segments),
+                _ => layers.push(RawLayer { paint, segments }),
+            }
+        }
+        usvg::Node::Image(_) | usvg::Node::Text(_) => {}
+    }
+}
+
 #[derive(serde::Serialize, Debug, Default)]
 pub struct OutlineSummary {
     /// SVG's resolved viewBox/width-height size
