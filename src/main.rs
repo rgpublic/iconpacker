@@ -71,7 +71,7 @@ struct ResolvedGlyph {
 /// this is the limit that actually tracks font size. It also bounds the
 /// number of distinct colors, since each color needs at least one layer.
 /// Override with `"max_layers"` in the config's `props`.
-const DEFAULT_MAX_LAYERS: usize = 32;
+const DEFAULT_MAX_LAYERS: usize = 128;
 
 fn describe_paint(p: &Paint) -> String {
     match p {
