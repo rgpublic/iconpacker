@@ -142,8 +142,17 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         min_rsb = min_rsb.min(rsb);
         x_max_extent = x_max_extent.max((lsb as i32 + glyph_width) as i16);
 
-        h_metrics.push(LongMetric { advance, side_bearing: lsb });
-        glyf_loca.add_glyph(&simple).map_err(|e| e.to_string())?;
+        if g.layers.is_empty() {
+            h_metrics.push(LongMetric { advance, side_bearing: lsb });
+            glyf_loca.add_glyph(&simple).map_err(|e| e.to_string())?;
+        } else {
+            // A color glyph is drawn entirely from its layer glyphs, so its
+            // own base glyph is left empty instead of duplicating the whole
+            // artwork as a merged fallback outline. (Its bbox above still
+            // counts toward the font's overall metrics.)
+            h_metrics.push(LongMetric { advance, side_bearing: 0 });
+            glyf_loca.add_glyph(&GlyfGlyph::Empty).map_err(|e| e.to_string())?;
+        }
     }
 
     // --- layer glyphs of color glyphs, after every base glyph so base glyph
