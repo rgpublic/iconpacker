@@ -136,6 +136,7 @@ pub fn parse_svg_layers(svg_path: &Path) -> Result<RawLayers, String> {
     for child in tree.root().children() {
         visit_layers(child, &mut layers, &mut notes);
     }
+    notes.sort();
     notes.dedup();
 
     Ok(RawLayers {
@@ -149,16 +150,12 @@ pub fn parse_svg_layers(svg_path: &Path) -> Result<RawLayers, String> {
 fn paint_of(fill: &usvg::Fill, notes: &mut Vec<String>) -> Paint {
     let color = match fill.paint() {
         usvg::Paint::Color(c) => *c,
-        usvg::Paint::LinearGradient(g) => {
-            notes.push("gradient fill approximated by its first stop color".to_string());
-            first_stop(g.stops())
-        }
-        usvg::Paint::RadialGradient(g) => {
-            notes.push("gradient fill approximated by its first stop color".to_string());
-            first_stop(g.stops())
+        usvg::Paint::LinearGradient(_) | usvg::Paint::RadialGradient(_) => {
+            notes.push("uses a gradient fill, which a font cannot represent (only flat colors); replace it with solid fills".to_string());
+            usvg::Color::black()
         }
         usvg::Paint::Pattern(_) => {
-            notes.push("pattern fill approximated as black".to_string());
+            notes.push("uses a pattern fill, which a font cannot represent (only flat colors); replace it with solid fills".to_string());
             usvg::Color::black()
         }
     };
@@ -170,18 +167,39 @@ fn paint_of(fill: &usvg::Fill, notes: &mut Vec<String>) -> Paint {
     }
 }
 
-fn first_stop(stops: &[usvg::Stop]) -> usvg::Color {
-    stops.first().map(|s| s.color()).unwrap_or_else(usvg::Color::black)
-}
-
 fn visit_layers(node: &usvg::Node, layers: &mut Vec<RawLayer>, notes: &mut Vec<String>) {
     match node {
         usvg::Node::Group(group) => {
+            // Anything a font outline cannot express is reported, never
+            // silently dropped: the SVG would render differently in the font
+            // than in a browser.
+            if group.opacity().get() < 1.0 {
+                notes.push("uses group opacity, which cannot be converted; bake the transparency into the fill colors instead".to_string());
+            }
+            if group.clip_path().is_some() {
+                notes.push("uses a clip path, which cannot be converted; convert the clipped shape to a plain path".to_string());
+            }
+            if group.mask().is_some() {
+                notes.push("uses a mask, which cannot be converted; convert the masked shape to a plain path".to_string());
+            }
+            if !group.filters().is_empty() {
+                notes.push("uses a filter (blur, shadow, ...), which cannot be converted; remove it".to_string());
+            }
+            if !matches!(group.blend_mode(), usvg::BlendMode::Normal) {
+                notes.push("uses a blend mode, which cannot be converted; remove it".to_string());
+            }
             for child in group.children() {
                 visit_layers(child, layers, notes);
             }
         }
         usvg::Node::Path(path) => {
+            if !path.is_visible() {
+                notes.push("contains a hidden shape (visibility: hidden); delete it from the SVG".to_string());
+                return;
+            }
+            if path.stroke().is_some() {
+                notes.push("uses a stroke, which cannot be converted; convert strokes to outlines (in Inkscape: Path > Stroke to Path)".to_string());
+            }
             let Some(fill) = path.fill() else { return };
             let paint = paint_of(fill, notes);
 
@@ -193,7 +211,12 @@ fn visit_layers(node: &usvg::Node, layers: &mut Vec<RawLayer>, notes: &mut Vec<S
                 _ => layers.push(RawLayer { paint, segments }),
             }
         }
-        usvg::Node::Image(_) | usvg::Node::Text(_) => {}
+        usvg::Node::Image(_) => {
+            notes.push("contains an embedded image, which cannot be converted; remove it".to_string());
+        }
+        usvg::Node::Text(_) => {
+            notes.push("contains live text, which cannot be converted; convert the text to paths".to_string());
+        }
     }
 }
 

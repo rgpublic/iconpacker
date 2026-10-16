@@ -187,7 +187,10 @@ fn main() -> ExitCode {
                 let label = &entry.src;
 
                 for note in &raw_layers.notes {
-                    eprintln!("warning: {}: {}", label, note);
+                    eprintln!("error: {}: {}", label, note);
+                }
+                if !raw_layers.notes.is_empty() {
+                    color_errors += 1;
                 }
 
                 if entry.color {
@@ -237,11 +240,12 @@ fn main() -> ExitCode {
                 } else if paints.len() > 1 {
                     let list: Vec<String> = paints.iter().map(describe_paint).collect();
                     eprintln!(
-                        "warning: {}: contains {} distinct colors ({}) but \"color\" is not set, so it is flattened to one monochrome shape",
+                        "error: {}: contains {} distinct colors ({}) but \"color\" is not set, so it would be flattened to one monochrome shape (set \"color\": true to keep the colors, or simplify the SVG to a single color)",
                         label,
                         paints.len(),
                         list.join(", ")
                     );
+                    color_errors += 1;
                 }
             }
         }
@@ -304,7 +308,7 @@ fn main() -> ExitCode {
     }
 
     if color_errors > 0 {
-        eprintln!("\n{} glyph(s) exceed the layer limit", color_errors);
+        eprintln!("\n{} glyph(s) have color or layer errors", color_errors);
         return ExitCode::FAILURE;
     }
 
