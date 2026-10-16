@@ -65,11 +65,13 @@ struct ResolvedGlyph {
     layers: Vec<FontLayer>,
 }
 
-/// Default cap on distinct colors per color glyph. Every extra color costs
-/// extra layer glyphs in the font, so an SVG with dozens of shades (a photo
-/// traced to vectors, say) is rejected rather than silently bloating it.
-/// Override with `"max_colors"` in the config's `props`.
-const DEFAULT_MAX_COLORS: usize = 8;
+/// Default cap on COLR layers per color glyph. Every layer costs extra glyph
+/// data in the font (roughly 25-30 bytes compressed), and layers can
+/// outnumber colors when same-colored shapes are interleaved in the SVG, so
+/// this is the limit that actually tracks font size. It also bounds the
+/// number of distinct colors, since each color needs at least one layer.
+/// Override with `"max_layers"` in the config's `props`.
+const DEFAULT_MAX_LAYERS: usize = 32;
 
 fn describe_paint(p: &Paint) -> String {
     match p {
@@ -143,12 +145,12 @@ fn main() -> ExitCode {
         .and_then(Value::as_str)
         .unwrap_or("(no family set)");
 
-    let max_colors = config
+    let max_layers = config
         .props
-        .get("max_colors")
+        .get("max_layers")
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_MAX_COLORS);
+        .unwrap_or(DEFAULT_MAX_LAYERS);
 
     let mut resolved = Vec::new();
     let mut missing = 0usize;
@@ -189,31 +191,10 @@ fn main() -> ExitCode {
                 }
 
                 if entry.color {
-                    if paints.len() > max_colors {
-                        eprintln!(
-                            "error: {}: {} distinct colors, but the limit is {} (set \"max_colors\" in props to raise it, or simplify the SVG)",
-                            label,
-                            paints.len(),
-                            max_colors
-                        );
-                        color_errors += 1;
-                    } else if paints.is_empty() {
+                    if paints.is_empty() {
                         eprintln!("warning: {}: marked color but has no filled paths; treated as monochrome", label);
                     } else {
-                        if paints.len() == 1 {
-                            if paints[0] == Paint::Foreground {
-                                eprintln!(
-                                    "warning: {}: marked color but contains only black/currentColor, so it behaves like a monochrome icon; remove \"color\" to keep it simple",
-                                    label
-                                );
-                            } else {
-                                eprintln!(
-                                    "warning: {}: marked color but contains only one color ({}); if it should follow CSS color, remove \"color\"",
-                                    label,
-                                    describe_paint(&paints[0])
-                                );
-                            }
-                        }
+                        let mut built: Vec<FontLayer> = Vec::new();
                         for l in &raw_layers.layers {
                             let layer_raw = RawOutline {
                                 width: raw_layers.width,
@@ -222,8 +203,35 @@ fn main() -> ExitCode {
                             };
                             let outline = build_glyph_outline(&layer_raw, args.upm, args.accuracy);
                             if !outline.contours.is_empty() {
-                                layers.push(FontLayer { paint: l.paint, outline });
+                                built.push(FontLayer { paint: l.paint, outline });
                             }
+                        }
+
+                        if built.len() > max_layers {
+                            eprintln!(
+                                "error: {}: {} layers ({} distinct colors), but the limit is {} (set \"max_layers\" in props to raise it; if the same colors alternate shape by shape, group same-colored shapes together in the SVG)",
+                                label,
+                                built.len(),
+                                paints.len(),
+                                max_layers
+                            );
+                            color_errors += 1;
+                        } else {
+                            if paints.len() == 1 {
+                                if paints[0] == Paint::Foreground {
+                                    eprintln!(
+                                        "warning: {}: marked color but contains only black/currentColor, so it behaves like a monochrome icon; remove \"color\" to keep it simple",
+                                        label
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "warning: {}: marked color but contains only one color ({}); if it should follow CSS color, remove \"color\"",
+                                        label,
+                                        describe_paint(&paints[0])
+                                    );
+                                }
+                            }
+                            layers = built;
                         }
                     }
                 } else if paints.len() > 1 {
@@ -296,7 +304,7 @@ fn main() -> ExitCode {
     }
 
     if color_errors > 0 {
-        eprintln!("\n{} glyph(s) exceed the color limit", color_errors);
+        eprintln!("\n{} glyph(s) exceed the layer limit", color_errors);
         return ExitCode::FAILURE;
     }
 
