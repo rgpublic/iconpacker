@@ -194,7 +194,7 @@ fn visit_layers(node: &usvg::Node, layers: &mut Vec<RawLayer>, notes: &mut Vec<S
         }
         usvg::Node::Path(path) => {
             if !path.is_visible() {
-                notes.push("contains a hidden shape (visibility: hidden); delete it from the SVG".to_string());
+                notes.push("contains an invisible shape (no fill and no stroke, e.g. fill=\"none\" without a stroke), which draws nothing; delete it from the SVG".to_string());
                 return;
             }
             if path.stroke().is_some() {
