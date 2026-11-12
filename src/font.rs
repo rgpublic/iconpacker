@@ -5,7 +5,6 @@
 use crate::outline::GlyphOutline;
 use crate::svg::Paint;
 use kurbo::BezPath;
-use write_fonts::tables::cmap::Cmap;
 use write_fonts::tables::colr::{BaseGlyph, Colr, Layer};
 use write_fonts::tables::cpal::{ColorRecord, Cpal};
 use write_fonts::tables::glyf::{Glyf, GlyfLocaBuilder, Glyph as GlyfGlyph, SimpleGlyph};
@@ -17,8 +16,9 @@ use write_fonts::tables::maxp::Maxp;
 use write_fonts::tables::name::{Name, NameRecord};
 use write_fonts::tables::os2::{Os2, SelectionFlags};
 use write_fonts::tables::post::Post;
-use write_fonts::types::{Fixed, GlyphId, GlyphId16, LongDateTime, NameId, Tag, Version16Dot16};
+use write_fonts::types::{Fixed, GlyphId, GlyphId16, LongDateTime, NameId, Tag, Uint24, Version16Dot16};
 use write_fonts::{dump_table, FontBuilder};
+use write_fonts::tables::cmap::{Cmap, CmapSubtable, DefaultUvs, EncodingRecord, PlatformId, UnicodeRange, VariationSelector};
 
 /// CPAL's reserved "foreground color" palette index: a COLR layer using it
 /// isn't tinted from the palette at all, it just paints in whatever color
@@ -89,6 +89,64 @@ struct Tables {
     loca: Loca,
     colr: Colr,
     cpal: Cpal,
+}
+
+/// Declares support for the emoji variation selectors (U+FE0E text, U+FE0F
+/// emoji) on every non-Private-Use codepoint in the font, using a cmap
+/// format 14 subtable with "default UVS" entries: the sequence renders with
+/// the same glyph as the plain codepoint. Real emoji fonts do this, and some
+/// browsers use it to decide whether a font can render an emoji sequence.
+fn add_variation_sequences(cmap: &mut Cmap, codepoints: &[u32]) {
+    let mut sorted: Vec<u32> = codepoints
+        .iter()
+        .copied()
+        .filter(|c| !(0xE000..=0xF8FF).contains(c))
+        .collect();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut ranges: Vec<UnicodeRange> = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut extra = 0u8;
+        while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 && extra < 255 {
+            i += 1;
+            extra += 1;
+        }
+        ranges.push(UnicodeRange::new(Uint24::new(start), extra));
+        i += 1;
+    }
+    if ranges.is_empty() {
+        return;
+    }
+
+    let selector = |vs: u32| {
+        VariationSelector::new(
+            Uint24::new(vs),
+            Some(DefaultUvs::new(ranges.len() as u32, ranges.clone())),
+            None,
+        )
+    };
+    // This write-fonts version takes the subtable length and record count as
+    // plain fields instead of computing them, so serialize once with a
+    // placeholder length to measure the real size, then build the final one.
+    let selectors = vec![selector(0xFE0E), selector(0xFE0F)];
+    let record_count = selectors.len() as u32;
+    let measured = CmapSubtable::format_14(0, record_count, selectors.clone());
+    let length = dump_table(&measured).map(|bytes| bytes.len() as u32).unwrap_or(0);
+    let subtable = CmapSubtable::format_14(length, record_count, selectors);
+
+    // Encoding records must stay sorted by (platform, encoding): the Unicode
+    // platform's variation record (encoding 5) goes after the other Unicode
+    // records and before the Windows ones.
+    let position = cmap
+        .encoding_records
+        .iter()
+        .take_while(|r| r.platform_id == PlatformId::Unicode)
+        .count();
+    cmap.encoding_records
+        .insert(position, EncodingRecord::new(PlatformId::Unicode, 5, subtable));
 }
 
 /// Glyph ID 0 is always the required, empty ".notdef" glyph. Glyph ID 1 is
@@ -270,7 +328,9 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
         .iter()
         .enumerate()
         .filter_map(|(i, g)| char::from_u32(g.codepoint).map(|ch| (ch, GlyphId::new((i + 2) as u32))));
-    let cmap = Cmap::from_mappings(mappings).map_err(|e| e.to_string())?;
+    let mut cmap = Cmap::from_mappings(mappings).map_err(|e| e.to_string())?;
+    let codepoints: Vec<u32> = glyphs.iter().map(|g| g.codepoint).collect();
+    add_variation_sequences(&mut cmap, &codepoints);
 
     // --- name (Windows, Unicode BMP, US English - the widely-supported minimum) ---
     let name_record = |id: u16, s: &str| NameRecord::new(3, 1, 0x0409, NameId::new(id), s.to_string().into());
