@@ -192,13 +192,11 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
     let (glyf, loca, loca_format): (Glyf, _, _) = glyf_loca.build();
 
     let num_glyphs = h_metrics.len() as u16;
-    // The glyphs themselves were positioned (in outline::build_glyph_outline)
-    // to span exactly [0, upm] - SVG bottom on the baseline, SVG top at the
-    // em's top edge - so the real ascender/descender are just the computed
-    // bbox, not a fabricated split. Clamping to at least [0, upm] keeps an
-    // empty font's metrics sane without inventing numbers for a real one.
-    let ascender = y_max;
-    let descender = y_min.min(0);
+    // Fixed metrics: the glyphs are scaled to span exactly [0, upm], so the
+    // em box is the ascender/descender, independent of which icons are in
+    // the font. This keeps line heights stable when icons are added or removed.
+    let ascender = upm as i16;
+    let descender = 0i16;
 
     // --- head ---
     let head = Head::new(
