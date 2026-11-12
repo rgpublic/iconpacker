@@ -405,16 +405,18 @@ fn build_tables(glyphs: &[FontGlyph], upm: u16, family: &str) -> Result<Tables, 
     // to whichever available font provides *color* glyph data for them -
     // a plain monochrome font is skipped in favor of the platform's own
     // color emoji font, even when it's the only font specified. Having a
-    // (structurally trivial) COLR table satisfies that check, so real
-    // emoji codepoints can be used directly instead of needing Private
-    // Use Area remapping.
+    // (structurally trivial) COLR table satisfies that check in Chrome and
+    // Firefox. Safari additionally needs the font to declare the emoji
+    // variation sequences (U+FE0E / U+FE0F) in a cmap format 14 subtable;
+    // see `add_variation_sequences`. Together they let real emoji codepoints
+    // be used directly instead of needing Private Use Area remapping.
     //
     // Glyph IDs here are exactly `index + 2` (see the cmap mapping above -
     // ID 0 is .notdef, ID 1 is the permanently-empty spacer), so they're
     // already in the ascending order the COLR spec requires for
     // baseGlyphRecords. Glyph ID 1 deliberately never gets an entry here:
     // it has no outline data to paint regardless.
-      //
+    //
     // Monochrome glyphs get one layer: their own base glyph, painted with the
     // foreground sentinel. Color glyphs get one layer per painted run, each
     // pointing at its own layer glyph. Layers of one glyph must be contiguous
